@@ -1,0 +1,2 @@
+# kalibret
+GUI to set LIBINPUT_CALIBRATION_MATRIX
