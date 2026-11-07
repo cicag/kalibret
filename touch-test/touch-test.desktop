@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Touch test
-Comment=Draw on the whole panel and recalibrate the touchscreen
-Exec=/home/mii/.local/bin/touch-test
-Icon=input-gaming
-Terminal=false
-Categories=Utility;Settings;

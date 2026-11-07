@@ -6,8 +6,8 @@ Free draw mode
     stroke and the header tracks the extreme coordinates reached, so dead
     edges and corners are easy to spot.  The canvas can be cleared without
     losing a calibration result, and a neighbouring *Result* button returns to
-    it.  The draw log and extents are saved to
-    ``~/.local/share/touch-test/last-draw.json``.
+    it.  The draw log and extents are saved to ``data/last-draw.json`` in
+    the repo folder.
 
 Calibrate mode
     Tap five targets (four corners and the centre).  Each tap is stored as a
@@ -20,21 +20,21 @@ Calibrate mode
     on panels that run rotated (this tablet uses ``transform 90``); fitting
     directly in logical screen space would introduce a 90 degree error.
 
-    Nothing is applied automatically.  The result screen has an *Apply*
-    button (it runs ``swaymsg input ... calibration_matrix`` and writes
-    ``~/.config/sway/local-touch-calibration.conf`` so the value survives a
-    reboot) and a *Revert* button that restores the previous matrix.
+    Nothing is applied automatically to the live system.  The result screen
+    has an *Apply* button that generates a udev rules file at
+    ``udev/99-kalibret-touchscreen.rules`` in the repo folder.  User
+    manually copies it to ``/etc/udev/rules.d/`` and runs
+    ``udevadm trigger`` (see ``udev/APPLY.md``).  There is also a *Revert*
+    button that removes the udev rules file from the repo.
 
-Run it through the ``touch-test`` wrapper so waybar is hidden for the
-duration of the test; the panel is otherwise under waybar's exclusive zone.
+Run it through the ``touch-test`` wrapper.  GUI appears on the tablet LCD
+when run via SSH with proper Wayland environment.
 """
 
 import datetime
-import glob
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 
@@ -42,9 +42,8 @@ import cairo
 import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("Pango", "1.0")
-gi.require_version("PangoCairo", "1.0")
-from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk
 
 CORNER = 96          # size of the corner hit zones (logical px)
 GRID_STEP = 100      # background grid spacing
@@ -55,9 +54,12 @@ GRID_COL = (0.20, 0.20, 0.26)
 TEXT = (0.804, 0.839, 0.957)
 MUTED = (0.54, 0.57, 0.67)
 
-DATA_DIR = os.path.expanduser("~/.local/share/touch-test")
-SWAY_CALIBRATION_FILE = os.path.expanduser(
-    "~/.config/sway/local-touch-calibration.conf")
+# Portable: all paths are based on the location of this script file (repo folder),
+# not on the current working directory or home user.
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(REPO_DIR, "kalibret.conf")
+DATA_DIR = os.path.join(REPO_DIR, "data")
+UDEV_DIR = os.path.join(REPO_DIR, "udev")
 
 # Targets are fractions of the logical screen.  They avoid the top status
 # panel and the bottom toolbar (see Toolbar layout below).
@@ -187,39 +189,12 @@ def flatten3(m):
     return [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2]]
 
 
-def matrix3(values):
-    return [[values[0], values[1], values[2]],
-            [values[3], values[4], values[5]],
-            [0.0, 0.0, 1.0]]
-
-
 def fmt_matrix(values):
     return " ".join("%.9f" % v for v in values)
 
 
-def transform_point(x, y, transform):
-    """Apply the wlroots output transform to normalised coordinates."""
-    if transform == 0:
-        return x, y
-    if transform == 1:
-        return 1.0 - y, x
-    if transform == 2:
-        return 1.0 - x, 1.0 - y
-    if transform == 3:
-        return y, 1.0 - x
-    if transform == 4:
-        return 1.0 - x, y
-    if transform == 5:
-        return y, x
-    if transform == 6:
-        return x, 1.0 - y
-    if transform == 7:
-        return 1.0 - y, 1.0 - x
-    return x, y
-
-
 def inverse_transform_point(x, y, transform):
-    """Inverse of :func:`transform_point` for the eight output transforms."""
+    """Inverse coordinate transform for the eight output transforms."""
     if transform == 0:
         return x, y
     if transform == 1:
@@ -252,74 +227,52 @@ def parse_transform(value):
     return 0
 
 
-def sway_environ():
-    env = dict(os.environ)
-    runtime = env.get("XDG_RUNTIME_DIR",
-                      "/run/user/%d" % os.getuid())
-    if "SWAYSOCK" not in env:
-        sockets = sorted(glob.glob(os.path.join(runtime, "sway-ipc.*.sock")))
-        if sockets:
-            env["SWAYSOCK"] = sockets[-1]
-    env.setdefault("XDG_RUNTIME_DIR", runtime)
-    return env
+def load_device_config():
+    """Read DEVICE, NAME, TRANSFORM from kalibret.conf in the repo folder.
 
+    Line format: DEVICE=/dev/input/event5
+                 NAME=Goodix Capacitive TouchScreen
+                 TRANSFORM=0
+    Comments starting with # are ignored.
 
-def sway_json(kind):
-    try:
-        out = subprocess.check_output(
-            ["swaymsg", "-t", kind, "-r"],
-            env=sway_environ(), stderr=subprocess.DEVNULL,
-            text=True, timeout=3)
-        return json.loads(out)
-    except Exception:
+    Returns dict with 'device', 'name', 'transform' keys, or None if not found.
+    """
+    if not os.path.exists(CONFIG_PATH):
         return None
+    config = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+    except OSError:
+        pass
+    if not config.get("DEVICE"):
+        return None
+    return config
 
 
 def get_touch_device():
-    """Return (identifier, current matrix, output info)."""
-    inputs = sway_json("get_inputs")
-    if inputs is None:
-        return None, None, None
-    device_id = None
-    matrix = None
-    for dev in inputs:
-        if dev.get("type") != "touch":
-            continue
-        device_id = dev.get("identifier")
-        matrix = (dev.get("libinput") or {}).get("calibration_matrix")
-        if matrix is not None:
-            try:
-                matrix = [float(v) for v in matrix]
-            except (TypeError, ValueError):
-                matrix = None
-        break
+    """Return (device_id, device_name, transform, current_matrix).
 
-    output = None
-    outputs = sway_json("get_outputs")
-    if outputs:
-        chosen = None
-        for candidate in outputs:
-            if candidate.get("focused") and candidate.get("active"):
-                chosen = candidate
-                break
-        if chosen is None:
-            for candidate in outputs:
-                if candidate.get("active"):
-                    chosen = candidate
-                    break
-        if chosen is None:
-            chosen = outputs[0]
-        mode = chosen.get("current_mode") or {}
-        rect = chosen.get("rect") or {}
-        output = {
-            "name": chosen.get("name"),
-            "transform": parse_transform(chosen.get("transform", "normal")),
-            "logical_w": rect.get("width") or 0,
-            "logical_h": rect.get("height") or 0,
-            "phys_w": mode.get("width") or rect.get("height") or 0,
-            "phys_h": mode.get("height") or rect.get("width") or 0,
-        }
-    return device_id, matrix, output
+    device_id is read from kalibret.conf DEVICE (portable config in repo).
+    device_name is read from kalibret.conf NAME (for udev rules matching).
+    transform is read from kalibret.conf TRANSFORM (0 = normal, default 0).
+    current_matrix is always None (no auto-detection of old matrix).
+    """
+    config = load_device_config()
+    if not config:
+        return None, None, 0, None
+
+    device_id = config.get("DEVICE")
+    device_name = config.get("NAME", "touchscreen")
+    transform = parse_transform(config.get("TRANSFORM", "0"))
+
+    return device_id, device_name, transform, None
 
 
 def _short_error(message):
@@ -354,10 +307,10 @@ class TouchTest(Gtk.Window):
         self.touch_last = {}
         self.last_touch = 0.0
 
-        self.device_id, self.current_matrix, self.output = get_touch_device()
-        self.transform = (self.output or {}).get("transform", 0)
-        self.phys_w = (self.output or {}).get("phys_w") or 0
-        self.phys_h = (self.output or {}).get("phys_h") or 0
+        self.device_name = None
+        self.device_id, self.device_name, self.transform, self.current_matrix = get_touch_device()
+        self.phys_w = 0
+        self.phys_h = 0
 
         self.mode = "test"          # test | calibrate | result
         self.calib_index = 0
@@ -365,12 +318,10 @@ class TouchTest(Gtk.Window):
         self.correction = None      # 3x3, physical pixel space
         self.correction_norm = None # 3x3, physical normalised space
         self.new_matrix = None
-        self.composed = False
         self.mean_error = None
         self.max_error = None
         self.save_error = ""
         self.apply_status = ""
-        self.applied_previous = None
         self.calib_ready_time = 0.0
         self._calib_tap = None
 
@@ -433,12 +384,8 @@ class TouchTest(Gtk.Window):
             self.bar.pack_start(self._button("Again", self.start_calibration),
                                 False, False, 0)
             if self.new_matrix is not None:
-                if self.applied_previous is not None:
-                    self.bar.pack_start(self._button("Revert", self.revert),
-                                        False, False, 0)
-                else:
-                    self.bar.pack_start(self._button("Apply", self.apply),
-                                        False, False, 0)
+                self.bar.pack_start(self._button("Apply", self.apply),
+                                    False, False, 0)
         self.bar.pack_start(self._button("Quit", self.quit), False, False, 0)
         self.bar.show_all()
 
@@ -531,7 +478,7 @@ class TouchTest(Gtk.Window):
         if not self.strokes:
             return
         if self.device_id is None:
-            self.device_id, _matrix, _output = get_touch_device()
+            self.device_id, self.device_name, _matrix, _output = get_touch_device()
         data = {
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
             "screen": [self.w, self.h],
@@ -643,18 +590,15 @@ class TouchTest(Gtk.Window):
         self.correction = None
         self.correction_norm = None
         self.new_matrix = None
-        self.composed = False
         self.mean_error = None
         self.max_error = None
         self.save_error = ""
         self.apply_status = ""
-        self.applied_previous = None
         self._calib_tap = None
         self.calib_ready_time = 0.0
-        self.device_id, self.current_matrix, self.output = get_touch_device()
-        self.transform = (self.output or {}).get("transform", 0)
-        self.phys_w = (self.output or {}).get("phys_w") or self.w
-        self.phys_h = (self.output or {}).get("phys_h") or self.h
+        self.device_id, self.device_name, self.transform, self.current_matrix = get_touch_device()
+        self.phys_w = self.w
+        self.phys_h = self.h
         self._sync_toolbar()
         self._save_draw_log()
         if self.w > 1 and self.h > 1:
@@ -737,17 +681,9 @@ class TouchTest(Gtk.Window):
         self.mean_error = sum(errors) / len(errors) if errors else 0.0
         self.max_error = max(errors) if errors else 0.0
 
-        if self.current_matrix is not None:
-            # M' = C_norm * M, because C_norm expects physical normalised
-            # coordinates and libinput's existing matrix produces them.
-            self.new_matrix = flatten3(matmul3(
-                self.correction_norm, matrix3(self.current_matrix)))
-            self.composed = True
-        else:
-            # No existing matrix: libinput is using identity, so the
-            # correction itself is the absolute matrix.
-            self.new_matrix = flatten3(self.correction_norm)
-            self.composed = False
+        # No existing matrix: libinput is using identity, so the
+        # correction itself is the absolute matrix.
+        self.new_matrix = flatten3(self.correction_norm)
 
         self._save_calibration()
         self._sync_toolbar()
@@ -775,7 +711,6 @@ class TouchTest(Gtk.Window):
             "correction_px": self.correction,
             "correction_normalised": self.correction_norm,
             "new_matrix": self.new_matrix,
-            "composed_with_current": self.composed,
             "mean_error_px": round(self.mean_error or 0.0, 2),
             "max_error_px": round(self.max_error or 0.0, 2),
         }
@@ -787,103 +722,71 @@ class TouchTest(Gtk.Window):
                     f.write(text)
             if self.new_matrix is not None:
                 self._write_matrix_files(self.new_matrix)
-                if self.current_matrix is not None:
-                    with open(os.path.join(DATA_DIR, "revert-matrix.txt"),
-                              "w") as f:
-                        f.write(fmt_matrix(self.current_matrix) + "\n")
-                    with open(os.path.join(DATA_DIR, "revert-command.txt"),
-                              "w") as f:
-                        f.write('swaymsg input "%s" calibration_matrix %s\n'
-                                % (self.device_id,
-                                   fmt_matrix(self.current_matrix)))
+                # Save matrix as reference for manual revert
+                with open(os.path.join(DATA_DIR, "revert-matrix.txt"),
+                          "w") as f:
+                    f.write(fmt_matrix(self.current_matrix or self.new_matrix)
+                            + "\n")
         except OSError as exc:
             self.save_error = _short_error(exc)
 
     def _write_matrix_files(self, values):
         os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(UDEV_DIR, exist_ok=True)
         matrix_text = fmt_matrix(values)
         with open(os.path.join(DATA_DIR, "latest-matrix.txt"), "w") as f:
             f.write(matrix_text + "\n")
-        conf = (
-            "# Generated by touch-test on %s.\n"
-            "# Loaded by the existing include local*.conf in "
-            "~/.config/sway/config.\n"
-            'input "%s" {\n'
-            "    calibration_matrix %s\n"
-            "}\n"
-        ) % (datetime.datetime.now().isoformat(timespec="seconds"),
-             self.device_id, matrix_text)
-        with open(os.path.join(DATA_DIR, "latest-apply.conf"), "w") as f:
-            f.write(conf)
-        with open(os.path.join(DATA_DIR, "latest-command.txt"), "w") as f:
-            f.write('swaymsg input "%s" calibration_matrix %s\n'
-                    % (self.device_id, matrix_text))
 
-    def _run_sway_input(self, values):
-        if not self.device_id:
-            return False, "touch device not found"
-        command = ["swaymsg", "input", self.device_id, "calibration_matrix"]
-        command.extend("%.9f" % v for v in values)
-        try:
-            result = subprocess.run(
-                command, env=sway_environ(), text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5)
-        except Exception as exc:
-            return False, _short_error(exc)
-        if result.returncode != 0:
-            return False, _short_error(result.stdout or "swaymsg failed")
-        return True, ""
+        # Udev rules file ready to copy to /etc/udev/rules.d/ by user.
+        rules = (
+            "# Generated by touch-test on %s.\n"
+            "# Copy this file to /etc/udev/rules.d/ and run:\n"
+            "#   sudo udevadm control --reload-rules\n"
+            "#   sudo udevadm trigger --subsystem-match=input\n"
+            'SUBSYSTEM=="input", ATTRS{name}=="*%s*", ENV{LIBINPUT_CALIBRATION_MATRIX}="%s"\n'
+        ) % (datetime.datetime.now().isoformat(timespec="seconds"),
+             self.device_name or "touchscreen", matrix_text)
+        with open(os.path.join(UDEV_DIR, "99-kalibret-touchscreen.rules"),
+                  "w") as f:
+            f.write(rules)
+
+        with open(os.path.join(UDEV_DIR, "APPLY.md"), "w") as f:
+            f.write(
+                "# How to apply udev rules (run as root/sudo)\n\n"
+                "1. Copy the rules file to the system:\n"
+                "   ```\n   sudo cp udev/99-kalibret-touchscreen.rules /etc/udev/rules.d/\n   ```\n\n"
+                "2. Reload udev rules:\n"
+                "   ```\n   sudo udevadm control --reload-rules\n   sudo udevadm trigger --subsystem-match=input\n   ```\n\n"
+                "3. Unplug and replug the touchscreen cable (or reboot)\n"
+                "   so the calibration matrix is applied by libinput.\n\n"
+                "To remove:\n"
+                "   ```\n   sudo rm /etc/udev/rules.d/99-kalibret-touchscreen.rules\n   sudo udevadm control --reload-rules\n   sudo udevadm trigger --subsystem-match=input\n   ```\n"
+            )
 
     def apply(self):
         if self.new_matrix is None:
             self.apply_status = "nothing to apply"
             self.area.queue_draw()
             return
-        previous = list(self.current_matrix) if self.current_matrix else None
-        ok, error = self._run_sway_input(self.new_matrix)
-        if not ok:
-            self.apply_status = "apply failed: " + error
-            self.area.queue_draw()
-            return
-        try:
-            os.makedirs(os.path.dirname(SWAY_CALIBRATION_FILE), exist_ok=True)
-            with open(SWAY_CALIBRATION_FILE, "w") as f:
-                f.write(
-                    "# Generated by touch-test on %s.\n"
-                    "# Loaded by the existing include local*.conf in "
-                    "~/.config/sway/config.\n"
-                    'input "%s" {\n'
-                    "    calibration_matrix %s\n"
-                    "}\n"
-                    % (datetime.datetime.now().isoformat(timespec="seconds"),
-                       self.device_id, fmt_matrix(self.new_matrix)))
-        except OSError as exc:
-            self.apply_status = "applied, save failed: " + _short_error(exc)
-            self.applied_previous = previous
-            self._sync_toolbar()
-            self.area.queue_draw()
-            return
-        self.applied_previous = previous
-        self.apply_status = "applied and saved for next login"
+        # Udev rules already generated by _save_calibration in udev/.
+        # User manually copies them to /etc/udev/rules.d/ (see udev/APPLY.md).
+        self.apply_status = ("saved to udev/99-kalibret-touchscreen.rules\n"
+                             "copy to /etc/udev/rules.d/ and run:\n"
+                             "  sudo udevadm control --reload-rules\n"
+                             "  sudo udevadm trigger --subsystem-match=input")
         self._sync_toolbar()
         self.area.queue_draw()
 
     def revert(self):
-        if self.applied_previous is None:
-            self.apply_status = "nothing to revert"
-            self.area.queue_draw()
-            return
-        ok, error = self._run_sway_input(self.applied_previous)
-        if not ok:
-            self.apply_status = "revert failed: " + error
-            self.area.queue_draw()
-            return
+        rules_path = os.path.join(UDEV_DIR, "99-kalibret-touchscreen.rules")
         try:
-            os.unlink(SWAY_CALIBRATION_FILE)
+            os.unlink(rules_path)
         except OSError:
-            pass
-        self.applied_previous = None
-        self.apply_status = "reverted to the previous matrix"
+            self.apply_status = "no udev rules file in udev/"
+            self._sync_toolbar()
+            self.area.queue_draw()
+            return
+        self.apply_status = "udev rules file removed from udev/"
         self._sync_toolbar()
         self.area.queue_draw()
 
@@ -893,14 +796,11 @@ class TouchTest(Gtk.Window):
         return "-" if value is None else str(int(round(value)))
 
     @staticmethod
-    def _layout(cr, text, size):
-        layout = PangoCairo.create_layout(cr)
-        layout.set_text(text, -1)
-        desc = Pango.FontDescription()
-        desc.set_family("monospace")
-        desc.set_size(int(size * Pango.SCALE))
-        layout.set_font_description(desc)
-        return layout
+    def _text_size(cr, text, size=13):
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(size)
+        xb, yb, w, h, xa, ya = cr.text_extents(text)
+        return w, h
 
     @staticmethod
     def _rounded(cr, x, y, w, h, r):
@@ -913,14 +813,15 @@ class TouchTest(Gtk.Window):
 
     def _text(self, cr, x, y, text, size=13, color=TEXT, alpha=1.0,
               center_x=False):
-        layout = self._layout(cr, text, size)
-        tw, th = layout.get_pixel_size()
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(size)
+        xb, yb, w, h, xa, ya = cr.text_extents(text)
         if center_x:
-            x -= tw / 2.0
+            x -= w / 2.0
         cr.set_source_rgba(color[0], color[1], color[2], alpha)
         cr.move_to(x, y)
-        PangoCairo.show_layout(cr, layout)
-        return tw, th
+        cr.show_text(text)
+        return w, h
 
     def _hud_lines(self, w, h):
         if self.mode == "calibrate":
@@ -942,7 +843,7 @@ class TouchTest(Gtk.Window):
                 % (len(self.samples), self.mean_error or 0.0,
                    self.max_error or 0.0),
                 matrix,
-                "file  ~/.local/share/touch-test/latest.json",
+                "file  data/latest.json",
             ]
             if self.save_error:
                 lines.append("save error: " + self.save_error)
@@ -965,9 +866,8 @@ class TouchTest(Gtk.Window):
         return lines
 
     def _panel(self, cr, w, lines):
-        layouts = [self._layout(cr, text, 13) for text in lines]
-        sizes = [layout.get_pixel_size() for layout in layouts]
-        line_h = max(size[1] for size in sizes)
+        sizes = [self._text_size(cr, text, 13) for text in lines]
+        line_h = max(size[1] for size in sizes) + 4
         width = max(size[0] for size in sizes)
         height = line_h * len(lines) + 6 * (len(lines) - 1) + 20
         px = (w - width) / 2.0 - 10
@@ -979,11 +879,13 @@ class TouchTest(Gtk.Window):
         cr.set_line_width(1)
         cr.stroke()
         ty = py + 10
-        for layout in layouts:
+        for text in lines:
+            cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(13)
             cr.set_source_rgba(*TEXT, 0.96)
             cr.move_to(px + 10, ty)
-            PangoCairo.show_layout(cr, layout)
-            ty += line_h + 6
+            cr.show_text(text)
+            ty += line_h
 
     def _draw_hud(self, cr, w, h):
         # outer frame: the actual screen edge
@@ -1049,15 +951,17 @@ class TouchTest(Gtk.Window):
             tx, ty = None, None
         cr.stroke()
 
-        layout = self._layout(cr, "%s %s" % (name, "[+]" if hit else "[-]"), 13)
-        tw, th = layout.get_pixel_size()
+        label = "%s %s" % (name, "[+]" if hit else "[-]")
+        tw, th = self._text_size(cr, label, 13)
         if tx is None:
             tx = w - o - 6 - tw
         if ty is None:
             ty = h - o - 6 - th
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(13)
         cr.set_source_rgba(*col, alpha)
         cr.move_to(tx, ty)
-        PangoCairo.show_layout(cr, layout)
+        cr.show_text(label)
 
     def _draw_samples(self, cr):
         for index, sample in enumerate(self.samples):
@@ -1136,10 +1040,6 @@ class TouchTest(Gtk.Window):
         self._sync_toolbar()
         self.area.queue_draw()
 
-    def clear(self):
-        """Compatibility alias: start a fresh free draw."""
-        self.start_draw()
-
     def quit(self):
         if self.quitting:
             return
@@ -1173,40 +1073,8 @@ class TouchTest(Gtk.Window):
         return False
 
 
-def revert_from_saved():
-    """CLI rescue path: restore the matrix stored in latest.json."""
-    path = os.path.join(DATA_DIR, "latest.json")
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        device = data.get("device")
-        previous = data.get("current_matrix")
-    except (OSError, ValueError):
-        print("no saved calibration in", path)
-        return 1
-    if not device or not previous:
-        print("saved calibration has no previous matrix")
-        return 1
-    command = ["swaymsg", "input", device, "calibration_matrix"]
-    command.extend("%.9f" % float(v) for v in previous)
-    try:
-        subprocess.run(command, env=sway_environ(), check=True)
-    except Exception as exc:
-        print("swaymsg failed:", exc)
-        return 1
-    try:
-        os.unlink(SWAY_CALIBRATION_FILE)
-    except OSError:
-        pass
-    print("restored", fmt_matrix(previous))
-    return 0
-
-
 def main():
-    if "--revert" in sys.argv[1:]:
-        return revert_from_saved()
-
-    calibrate = "--calibrate" in sys.argv[1:]
+    calibrate = "--draw" not in sys.argv[1:]
 
     # Wayland app_id, same convention as the other touch apps.
     GLib.set_prgname("org.swaytablet.touchtest")
@@ -1217,9 +1085,21 @@ def main():
 
     prov = Gtk.CssProvider()
     prov.load_from_data(CSS)
-    Gtk.StyleContext.add_provider_for_screen(
-        Gdk.Screen.get_default(), prov,
-        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    screen = Gdk.Screen.get_default()
+    if screen is not None:
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    if not Gtk.init_check(["kalibret"]):
+        print("ERROR: GTK could not be initialized.")
+        print("Make sure you are running on the tablet's local display,")
+        print("or via SSH with proper Wayland environment:")
+        print("  export XDG_RUNTIME_DIR=/run/user/$(id -u)")
+        print("  export WAYLAND_DISPLAY=wayland-0")
+        print("  export GDK_BACKEND=wayland")
+        print("Also ensure Wayland is running on the tablet.")
+        return 1
 
     win = TouchTest()
     win.show_all()
