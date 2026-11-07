@@ -4,7 +4,7 @@
   <img src="images/kalibret.png" alt="Kalibret touchscreen calibration GUI" width="600"/>
 </p>
 
-Simple GUI to set LIBINPUT_CALIBRATION_MATRIX
+Simple GUI to set LIBINPUT_CALIBRATION_MATRIX.
 Calibration value are saved as **udev rules** in the udev folder, you can apply it later yourself
 
 ## Features
@@ -45,13 +45,11 @@ sudo apt install -y \
 
 ### Device access (input group)
 
-Make sure your account is member of the `input` group.
+Make sure your account is member of the `input` group, then re-login.
 
 ```bash
 sudo usermod -aG input $USER
 ```
-
-Then **logout and login back** for the new group to take effect.
 
 ## Usage steps
 
@@ -77,7 +75,7 @@ TRANSFORM=0
 
 Replace `/dev/input/event5` with the device path found in step 1.
 Replace `Goodix Capacitive TouchScreen` with the actual device name from
-`libinput list-devices` (used for udev rules `ATTRS{name}` matching).
+`libinput list-devices`
 
 Set `TRANSFORM` to your screen rotation:
 - `0` = normal (default)
@@ -99,9 +97,9 @@ Set `TRANSFORM` to your screen rotation:
 
 The GUI appears on your tablet's local LCD screen. Choose your display server:
 
-#### Option A: Local terminal (no SSH, directly on the tablet)
+#### Option A: Local terminal (directly on the tablet)
 
-If you have direct access on the device (physical keyboard or on-screen keyboard), most environment variables are already set by your graphical session. You usually only need to set `GDK_BACKEND`:
+If you have direct access on the device (physical keyboard or on-screen keyboard), most environment variables are already set by your graphical session.
 
 ```bash
 cd /path/to/kalibret
@@ -144,24 +142,6 @@ unset GDK_BACKEND
 ./kalibret.sh
 ```
 
-The "Touch test" window will appear on the **tablet LCD**. Finger touch will
-be captured directly.
-
-**Quick check** — see what is already set in your local session:
-
-```bash
-echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
-echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
-echo "GDK_BACKEND=$GDK_BACKEND"
-```
-
-If `WAYLAND_DISPLAY` is empty on Wayland, set it manually:
-
-```bash
-export WAYLAND_DISPLAY=wayland-0   # or wayland-1, etc.
-```
-
-
 ### 4. Calibrate
 
 Tap 5 targets that appear on screen (4 corners + center). When done, the screen changes to **Result**.
@@ -171,8 +151,6 @@ To skip calibration and go straight to free draw mode, run with `--draw`:
 ```bash
 ./kalibret.sh --draw
 ```
-
-4. Click **Apply** on the result screen.
 
 ### 5. Apply udev rules (manual, needs sudo)
 
@@ -191,8 +169,6 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=input
 ```
 
-Full instructions are also in `udev/APPLY.md` (generated automatically).
-
 ### 6. Remove / Revert
 
 To return to the original state:
@@ -204,10 +180,3 @@ sudo udevadm trigger --subsystem-match=input
 ```
 
 Or click **Revert** in the GUI to remove the udev rules file from `udev/`.
-
-## Config files
-
-- `kalibret.conf` — device declaration (`DEVICE=/dev/input/eventX`)
-- Calibration results saved in `data/latest.json` and `data/latest-matrix.txt`
-- Udev rules generated at `udev/99-kalibret-touchscreen.rules`
-- Apply instructions in `udev/APPLY.md`
